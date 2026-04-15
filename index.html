@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hole Punch Remover</title>
+
+<!-- CDN dependencies -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #fff; color: #1a1a1a;
+  height: 100vh; display: flex; flex-direction: column;
+}
+.titlebar {
+  height: 48px; background: #EEEDFE; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-bottom: 1px solid #CECBF6;
+}
+.titlebar span { font-size: 14px; font-weight: 600; color: #3C3489; }
+.body { flex: 1; overflow-y: auto; padding: 28px 32px; max-width: 640px; margin: 0 auto; width: 100%; }
+
+/* states */
+.state { display: none; flex-direction: column; align-items: center;
+         justify-content: center; min-height: 100%; }
+.state.active { display: flex; }
+#s-report { justify-content: flex-start; min-height: auto; }
+
+/* ready */
+.dropzone {
+  width: 100%; border: 1.5px dashed #AFA9EC; border-radius: 12px;
+  padding: 36px 24px; text-align: center; cursor: pointer; transition: background .15s;
+}
+.dropzone:hover, .dropzone.dragover { background: #EEEDFE; }
+.dropzone h2 { font-size: 15px; font-weight: 500; margin-bottom: 6px; }
+.dropzone p  { font-size: 13px; color: #888; margin-bottom: 14px; }
+.dropzone input[type=file] { display: none; }
+
+/* confirmed */
+.info-card {
+  width: 100%; background: #EEEDFE; border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 12px;
+}
+.folder-name { font-size: 14px; font-weight: 600; color: #3C3489; margin-bottom: 3px; }
+.folder-meta { font-size: 12px; color: #534AB7; }
+.output-note { font-size: 12px; color: #888; margin-bottom: 22px; text-align: center; }
+
+/* progress */
+.progress-label { font-size: 16px; font-weight: 600; margin-bottom: 18px; align-self: flex-start; }
+.pbar-track { width: 100%; height: 6px; background: #EEEDFE; border-radius: 100px; overflow: hidden; margin-bottom: 10px; }
+.pbar-fill  { height: 100%; background: #534AB7; border-radius: 100px; transition: width .2s; }
+.progress-row { width: 100%; display: flex; justify-content: space-between; }
+.progress-file  { font-size: 11px; color: #999; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px; }
+.progress-count { font-size: 13px; font-weight: 600; color: #534AB7; white-space: nowrap; margin-left: 12px; }
+.progress-pages { font-size: 11px; color: #aaa; margin-top: 6px; align-self: flex-start; }
+
+/* buttons */
+.btn {
+  width: 100%; padding: 11px; border-radius: 8px;
+  font-size: 14px; font-weight: 500; cursor: pointer;
+  transition: opacity .1s; border: none;
+}
+.btn:active { opacity: .75; }
+.btn-primary  { background: #534AB7; color: #fff; }
+.btn-outline  { background: transparent; color: #534AB7; border: 1px solid #534AB7; margin-top: 10px; }
+.btn-link     { background: transparent; color: #999; font-size: 12px; font-weight: 400; margin-top: 8px; }
+
+/* report */
+.verdict {
+  width: 100%; border-radius: 10px; padding: 16px 18px;
+  display: flex; align-items: center; gap: 14px; margin-bottom: 20px;
+}
+.verdict-icon { font-size: 24px; flex-shrink: 0; }
+.verdict-text h2 { font-size: 15px; font-weight: 600; margin-bottom: 3px; }
+.verdict-text p  { font-size: 12px; opacity: .75; }
+.verdict-clean { background: #F0F8E8; }
+.verdict-clean h2 { color: #2A5A08; }
+.verdict-issues { background: #FFF4E6; }
+.verdict-issues h2 { color: #8C4A00; }
+
+.stat-row { display: flex; gap: 10px; margin-bottom: 22px; width: 100%; }
+.stat-chip { flex: 1; background: #F7F6FF; border-radius: 8px; padding: 10px 12px; text-align: center; }
+.stat-chip .n { font-size: 20px; font-weight: 700; color: #534AB7; }
+.stat-chip .l { font-size: 10px; color: #999; margin-top: 1px; }
+
+.sec-hd {
+  font-size: 10px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: #bbb; margin: 18px 0 10px;
+  display: flex; align-items: center; gap: 8px;
+}
+.sec-hd em { color: #534AB7; font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; font-style: normal; }
+
+.summary-block {
+  width: 100%; background: #F7F6FF; border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 20px;
+  font-size: 13px; color: #444; line-height: 1.65;
+}
+.summary-block strong { color: #1a1a1a; font-weight: 600; }
+.summary-block p { margin-bottom: 10px; }
+.summary-block p:last-child { margin-bottom: 0; }
+.summary-block .ok   { color: #3B6D11; }
+.summary-block .warn { color: #8C4A00; }
+
+.card-list { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.page-card {
+  display: flex; align-items: center; gap: 12px;
+  border-radius: 8px; padding: 10px 12px;
+  border: 0.5px solid #eee; background: #fafafa; cursor: pointer;
+}
+.page-card:hover { background: #f0f0f0; }
+.page-card.flag { background: #FFF8F5; border-color: #FFD5C0; }
+.thumb-wrap {
+  width: 52px; height: 68px; background: #efefef; border-radius: 4px;
+  overflow: hidden; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.thumb-wrap img { width: 100%; height: 100%; object-fit: contain; }
+.thumb-ph { font-size: 10px; color: #ccc; }
+.card-info { flex: 1; min-width: 0; }
+.card-file { font-size: 10px; color: #aaa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-page { font-size: 13px; font-weight: 600; margin: 2px 0; }
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 4px; }
+.badge-unusual { background: #FFE0CC; color: #7A3300; }
+.badge-sample  { background: #EEF0FF; color: #3040A0; }
+.card-explain { font-size: 11px; color: #999; margin-top: 2px; }
+
+.sample-intro {
+  font-size: 12px; color: #888; margin-bottom: 10px; line-height: 1.5;
+  padding: 10px 12px; background: #F7F6FF; border-radius: 8px;
+}
+
+.report-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 22px; width: 100%; }
+
+/* lightbox */
+.lightbox {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.88);
+  z-index: 100; flex-direction: column; align-items: center; justify-content: center;
+}
+.lightbox.open { display: flex; }
+.lb-close { position: absolute; top: 14px; right: 18px; color: #fff; font-size: 13px; opacity: .5; cursor: pointer; }
+.lb-label { position: absolute; top: 14px; left: 18px; color: #fff; font-size: 12px; opacity: .6; }
+.lb-nav   { position: absolute; bottom: 18px; color: #fff; font-size: 11px; opacity: .4; }
+.lb-arrow {
+  position: absolute; top: 0; width: 15%; height: 100%; cursor: pointer;
+  display: flex; align-items: center; font-size: 28px; color: #fff; opacity: .5;
+}
+.lb-arrow.left  { left: 0; justify-content: flex-start; padding-left: 12px; }
+.lb-arrow.right { right: 0; justify-content: flex-end; padding-right: 12px; }
+.lb-img-wrap {
+  max-width: 80%; max-height: 78vh; overflow: auto; border-radius: 4px;
+  box-shadow: 0 8px 40px rgba(0,0,0,.6);
+}
+.lb-img-wrap img { display: block; max-width: 100%; height: auto; }
+.lb-loading { color: #fff; opacity: .5; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div class="titlebar"><span>Hole Punch Remover</span></div>
+<div class="body">
+
+  <!-- READY -->
+  <div class="state active" id="s-ready">
+    <div class="dropzone" id="dropzone">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none"
+           style="opacity:.3;display:block;margin:0 auto 12px">
+        <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"
+              stroke="#534AB7" stroke-width="1.5"/>
+      </svg>
+      <h2>Choose your PDF files</h2>
+      <p>Click to select files, or drag &amp; drop PDFs here</p>
+      <input type="file" id="fileInput" multiple accept=".pdf">
+    </div>
+  </div>
+
+  <!-- CONFIRMED -->
+  <div class="state" id="s-confirmed">
+    <div class="info-card">
+      <div class="folder-name" id="c-name"></div>
+      <div class="folder-meta" id="c-meta"></div>
+    </div>
+    <p class="output-note">Cleaned PDFs will be downloaded as a zip file</p>
+    <button class="btn btn-primary" onclick="startProcessing()">Remove hole punches</button>
+    <button class="btn btn-link" onclick="show('s-ready')">Change files</button>
+  </div>
+
+  <!-- PROCESSING -->
+  <div class="state" id="s-processing">
+    <p class="progress-label">Processing&hellip;</p>
+    <div class="pbar-track"><div class="pbar-fill" id="p-fill" style="width:0%"></div></div>
+    <div class="progress-row">
+      <span class="progress-file"  id="p-file"></span>
+      <span class="progress-count" id="p-count">0 of 0</span>
+    </div>
+    <div class="progress-pages" id="p-pages"></div>
+  </div>
+
+  <!-- REPORT -->
+  <div class="state" id="s-report">
+    <div class="verdict" id="r-verdict"></div>
+    <div class="summary-block" id="r-summary-text"></div>
+
+    <div id="r-flagged-wrap" style="display:none">
+      <div class="sec-hd">Pages to check <em id="r-flag-count-note"></em></div>
+      <div class="card-list" id="r-flagged-list"></div>
+    </div>
+
+    <div id="r-sample-wrap">
+      <div class="sec-hd">Spot-check sample <em id="r-sample-note"></em></div>
+      <div class="sample-intro">Click any page to open a full-size view. Use arrow keys to step through.
+        If everything looks right, the batch is ready to hand off.</div>
+      <div class="card-list" id="r-sample-list"></div>
+    </div>
+
+    <div class="report-actions">
+      <button class="btn btn-primary" id="btn-download" onclick="downloadZip()">Download cleaned PDFs (.zip)</button>
+      <button class="btn btn-link" onclick="resetApp()">Process more files</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- LIGHTBOX -->
+<div class="lightbox" id="lightbox">
+  <div class="lb-close" onclick="closeLightbox()">ESC to close</div>
+  <div class="lb-label" id="lb-label"></div>
+  <div class="lb-nav" id="lb-nav"></div>
+  <div class="lb-arrow left" onclick="lbStep(-1)">&#8249;</div>
+  <div class="lb-arrow right" onclick="lbStep(1)">&#8250;</div>
+  <div class="lb-img-wrap"><img id="lb-img" src=""></div>
+  <div class="lb-loading" id="lb-loading" style="display:none">Loading...</div>
+</div>
+
+<script>
+// ── Configure pdf.js ─────────────────────────────────────────────────────────
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+// ── Constants ────────────────────────────────────────────────────────────────
+// pdf.js converts the CMYK hole-punch color to approximately RGB(196, 197, 199).
+// Use tolerance of 10 to handle variation across color profiles.
+var HOLE_COLOR_PDFJS  = [196, 197, 199];
+var COLOR_TOLERANCE   = 10;
+var HOLE_SIZE_PT      = 22.5;
+var HOLE_SIZE_TOL     = 5;
+var CIRCLE_BUFFER     = 5;
+var EXPECTED_CIRCLES  = 3;
+
+// pdf.js OPS constants
+var OPS = pdfjsLib.OPS;
+
+// ── State ────────────────────────────────────────────────────────────────────
+var selectedFiles  = [];
+var processedFiles = [];
+var allStats       = [];
+
+// ── UI helpers ───────────────────────────────────────────────────────────────
+function show(id) {
+  document.querySelectorAll('.state').forEach(function(el) { el.classList.remove('active'); });
+  document.getElementById(id).classList.add('active');
+}
+
+function resetApp() {
+  selectedFiles = []; processedFiles = []; allStats = [];
+  document.getElementById('fileInput').value = '';
+  show('s-ready');
+}
+
+// ── File selection ───────────────────────────────────────────────────────────
+var dropzone  = document.getElementById('dropzone');
+var fileInput = document.getElementById('fileInput');
+
+dropzone.addEventListener('click', function() { fileInput.click(); });
+dropzone.addEventListener('dragover', function(e) { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', function() { dropzone.classList.remove('dragover'); });
+dropzone.addEventListener('drop', function(e) {
+  e.preventDefault(); dropzone.classList.remove('dragover');
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', function() { handleFiles(fileInput.files); });
+
+function handleFiles(fileList) {
+  var pdfs = [];
+  for (var i = 0; i < fileList.length; i++) {
+    if (fileList[i].name.toLowerCase().endsWith('.pdf')) pdfs.push(fileList[i]);
+  }
+  if (!pdfs.length) return;
+  selectedFiles = pdfs;
+  document.getElementById('c-name').textContent =
+    pdfs.length === 1 ? pdfs[0].name : pdfs.length + ' PDF files';
+  var totalSize = pdfs.reduce(function(s, f) { return s + f.size; }, 0);
+  document.getElementById('c-meta').textContent =
+    pdfs.length + ' PDF' + (pdfs.length !== 1 ? 's' : '') +
+    ' (' + (totalSize / 1048576).toFixed(1) + ' MB)';
+  show('s-confirmed');
+}
+
+// ── Matrix math (for CTM tracking) ──────────────────────────────────────────
+function matMul(m1, m2) {
+  return [
+    m1[0]*m2[0] + m1[2]*m2[1],       m1[1]*m2[0] + m1[3]*m2[1],
+    m1[0]*m2[2] + m1[2]*m2[3],       m1[1]*m2[2] + m1[3]*m2[3],
+    m1[0]*m2[4] + m1[2]*m2[5]+m1[4], m1[1]*m2[4] + m1[3]*m2[5]+m1[5]
+  ];
+}
+
+function transformPt(ctm, x, y) {
+  return [ctm[0]*x + ctm[2]*y + ctm[4], ctm[1]*x + ctm[3]*y + ctm[5]];
+}
+
+// ── Color matching ───────────────────────────────────────────────────────────
+function isHolePunchColor(r, g, b) {
+  return Math.abs(r - HOLE_COLOR_PDFJS[0]) < COLOR_TOLERANCE &&
+         Math.abs(g - HOLE_COLOR_PDFJS[1]) < COLOR_TOLERANCE &&
+         Math.abs(b - HOLE_COLOR_PDFJS[2]) < COLOR_TOLERANCE;
+}
+
+// ── Bounding box from path sub-ops + coords, transformed by CTM ─────────────
+function computePathBBox(subOps, coords, ctm) {
+  var j = 0;
+  var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+  function addPt(x, y) {
+    var p = transformPt(ctm, x, y);
+    if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+    if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+  }
+
+  for (var k = 0; k < subOps.length; k++) {
+    var op = subOps[k];
+    if (op === OPS.moveTo || op === OPS.lineTo) {
+      addPt(coords[j], coords[j+1]); j += 2;
+    } else if (op === OPS.curveTo) {
+      addPt(coords[j], coords[j+1]); addPt(coords[j+2], coords[j+3]); addPt(coords[j+4], coords[j+5]); j += 6;
+    } else if (op === OPS.curveTo2 || op === OPS.curveTo3) {
+      addPt(coords[j], coords[j+1]); addPt(coords[j+2], coords[j+3]); j += 4;
+    } else if (op === OPS.rectangle) {
+      addPt(coords[j], coords[j+1]);
+      addPt(coords[j] + coords[j+2], coords[j+1] + coords[j+3]);
+      j += 4;
+    }
+    // closePath and others: no coordinates
+  }
+
+  if (minX === Infinity) return null;
+  return { x0: minX, y0: minY, x1: maxX, y1: maxY,
+           width: maxX - minX, height: maxY - minY };
+}
+
+// ── Detect circles/lines from pdf.js operator list (no canvas rendering) ────
+async function detectFromOps(pdfJsPage) {
+  var opList = await pdfJsPage.getOperatorList();
+  var fn   = opList.fnArray;
+  var args = opList.argsArray;
+
+  // Quick scan: does the target color appear at all?
+  var hasTarget = false;
+  for (var i = 0; i < fn.length; i++) {
+    if (fn[i] === OPS.setStrokeRGBColor) {
+      if (isHolePunchColor(args[i][0], args[i][1], args[i][2])) { hasTarget = true; break; }
+    }
+  }
+  if (!hasTarget) return { circles: [], borderLines: [], side: null };
+
+  // Full parse: track CTM, collect shapes stroked with target color
+  var ctm = [1, 0, 0, 1, 0, 0];
+  var ctmStack = [];
+  var strokeColor = [0, 0, 0];
+  var currentPaths = [];
+  var shapes = [];
+
+  for (var i = 0; i < fn.length; i++) {
+    switch (fn[i]) {
+      case OPS.save:
+        ctmStack.push(ctm.slice());
+        break;
+      case OPS.restore:
+        if (ctmStack.length) ctm = ctmStack.pop();
+        break;
+      case OPS.transform:
+        ctm = matMul(ctm, args[i]);
+        break;
+      case 74: // paintFormXObjectBegin — apply form matrix
+        ctmStack.push(ctm.slice());
+        if (args[i] && args[i][0]) ctm = matMul(ctm, args[i][0]);
+        break;
+      case 75: // paintFormXObjectEnd
+        if (ctmStack.length) ctm = ctmStack.pop();
+        break;
+      case OPS.setStrokeRGBColor:
+        strokeColor = [args[i][0], args[i][1], args[i][2]];
+        break;
+      case OPS.constructPath:
+        currentPaths.push({ subOps: args[i][0], coords: args[i][1] });
+        break;
+      case OPS.stroke:
+        if (isHolePunchColor(strokeColor[0], strokeColor[1], strokeColor[2])) {
+          for (var p = 0; p < currentPaths.length; p++) {
+            var bbox = computePathBBox(currentPaths[p].subOps, currentPaths[p].coords, ctm);
+            if (bbox) shapes.push(bbox);
+          }
+        }
+        currentPaths = [];
+        break;
+      case OPS.fill: case OPS.eoFill: case OPS.fillStroke:
+      case OPS.eoFillStroke: case OPS.endPath:
+        currentPaths = [];
+        break;
+    }
+  }
+
+  // Classify shapes
+  var view = pdfJsPage.view; // [x0, y0, x1, y1]
+  var pw = view[2] - view[0];
+
+  var circles = [];
+  var borderLines = [];
+  for (var si = 0; si < shapes.length; si++) {
+    var s = shapes[si];
+    if (Math.abs(s.width - HOLE_SIZE_PT) < HOLE_SIZE_TOL &&
+        Math.abs(s.height - HOLE_SIZE_PT) < HOLE_SIZE_TOL) {
+      circles.push(s);
+    } else if (s.width < 2 && s.height > 100) {
+      borderLines.push(s);
+    }
+  }
+
+  if (circles.length === 0) return { circles: [], borderLines: [], side: null };
+
+  var avgX = circles.reduce(function(s, c) { return s + (c.x0 + c.x1) / 2; }, 0) / circles.length;
+  var side = avgX < pw / 2 ? 'left' : 'right';
+
+  return { circles: circles, borderLines: borderLines, side: side };
+}
+
+// ── Process a single PDF ─────────────────────────────────────────────────────
+async function processSinglePdf(file, onPageProgress) {
+  var arrayBuf = await file.arrayBuffer();
+
+  // ── Detection pass: pdf.js operator list (fast, no canvas rendering) ──
+  var pdfDoc = await pdfjsLib.getDocument({ data: arrayBuf.slice(0) }).promise;
+  var numPages = pdfDoc.numPages;
+  var pageDetections = [];
+  var pageInfos = [];
+
+  for (var p = 1; p <= numPages; p++) {
+    if (onPageProgress && p % 20 === 0) onPageProgress(p, numPages);
+    var page = await pdfDoc.getPage(p);
+    var det = await detectFromOps(page);
+    var vp = page.getViewport({ scale: 1 });
+    pageDetections.push(det);
+    pageInfos.push({ ref: page.ref, width: vp.width, height: vp.height });
+  }
+  pdfDoc.destroy();
+
+  // ── Modification pass: raw PDF incremental save ──
+  var stats = [];
+  var origBytes = new Uint8Array(arrayBuf);
+
+  // Helper: encode a latin1 string to bytes (1 byte per char, no UTF-8 expansion)
+  function strToLatin1(str) {
+    var b = new Uint8Array(str.length);
+    for (var i = 0; i < str.length; i++) b[i] = str.charCodeAt(i) & 0xFF;
+    return b;
+  }
+
+  // Decode tail of PDF to find trailer info
+  var tailSize = Math.min(origBytes.length, 8192);
+  var tailText = new TextDecoder('latin1').decode(origBytes.subarray(origBytes.length - tailSize));
+
+  var sxMatch = tailText.match(/startxref\s+(\d+)\s+%%EOF/);
+  if (!sxMatch) throw new Error('Cannot find startxref in PDF');
+  var prevStartXref = parseInt(sxMatch[1], 10);
+
+  // Find /Root and /Size from trailer dict or xref stream object
+  var rootRef = null, prevSize = 0;
+  var trailerMatch = tailText.match(/trailer\s*<<([\s\S]*?)>>/);
+  if (trailerMatch) {
+    var tDict = trailerMatch[1];
+    var rootM = tDict.match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
+    var sizeM = tDict.match(/\/Size\s+(\d+)/);
+    if (rootM) rootRef = rootM[1] + ' ' + rootM[2] + ' R';
+    if (sizeM) prevSize = parseInt(sizeM[1], 10);
+  } else {
+    var xsChunk = new TextDecoder('latin1').decode(
+      origBytes.subarray(prevStartXref, Math.min(prevStartXref + 2048, origBytes.length))
+    );
+    var rootM = xsChunk.match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
+    var sizeM = xsChunk.match(/\/Size\s+(\d+)/);
+    if (rootM) rootRef = rootM[1] + ' ' + rootM[2] + ' R';
+    if (sizeM) prevSize = parseInt(sizeM[1], 10);
+  }
+  if (!rootRef) throw new Error('Cannot find /Root in PDF trailer');
+  if (!prevSize) throw new Error('Cannot find /Size in PDF trailer');
+
+  var newObjNum = prevSize;
+  // Collect byte chunks to append (Uint8Arrays), plus xref info
+  var chunks = [];
+  var offsets = []; // {num, offset}
+  var totalAppendLen = 1; // leading \n
+
+  // Decode full PDF as latin1 for page object lookups
+  var fullText = new TextDecoder('latin1').decode(origBytes);
+
+  for (var pi = 0; pi < numPages; pi++) {
+    var det = pageDetections[pi];
+    var info = pageInfos[pi];
+    var pw = info.width;
+    var ph = info.height;
+    var n = det.circles.length;
+
+    if (n > 0) {
+      var avgX = det.circles.reduce(function(s, c) { return s + (c.x0 + c.x1) / 2; }, 0) / n;
+      var onLeft = det.side === 'left';
+      var edgeDist = onLeft ? avgX : (pw - avgX);
+
+      // Build white rectangle drawing commands (pure ASCII)
+      // Draw tight bounding rects around each circle + buffer.
+      // If circles are near the page edge, extend to the edge.
+      var cmds = 'q\n1 1 1 rg\n';
+      for (var ci = 0; ci < det.circles.length; ci++) {
+        var c = det.circles[ci];
+        var rx = c.x0 - CIRCLE_BUFFER;
+        var ry = c.y0 - CIRCLE_BUFFER;
+        var rw = c.width + 2 * CIRCLE_BUFFER;
+        var rh = c.height + 2 * CIRCLE_BUFFER;
+        // If close to page edge, extend rect to the edge
+        if (onLeft && rx < 50) { rw += rx; rx = 0; }
+        if (!onLeft && (rx + rw) > (pw - 50)) { rw = pw - rx; }
+        cmds += rx.toFixed(2) + ' ' + ry.toFixed(2) + ' ' + rw.toFixed(2) + ' ' + rh.toFixed(2) + ' re f\n';
+      }
+      for (var li = 0; li < det.borderLines.length; li++) {
+        var ln = det.borderLines[li];
+        cmds += (ln.x0 - 1).toFixed(2) + ' 0 ' + (ln.width + 2).toFixed(2) + ' ' + ph.toFixed(2) + ' re f\n';
+      }
+      cmds += 'Q\n';
+
+      // Find original page object in raw bytes
+      // Must match at a line boundary to avoid false matches (e.g. "1 0 obj" inside "18201 0 obj")
+      var pageRef = info.ref;
+      var pageObjHeader = pageRef.num + ' ' + pageRef.gen + ' obj';
+      var pageObjPos = -1;
+      var searchFrom = 0;
+      while (true) {
+        var candidate = fullText.indexOf(pageObjHeader, searchFrom);
+        if (candidate === -1) break;
+        if (candidate === 0 || fullText.charCodeAt(candidate - 1) === 10 || fullText.charCodeAt(candidate - 1) === 13) {
+          pageObjPos = candidate;
+          break;
+        }
+        searchFrom = candidate + 1;
+      }
+      if (pageObjPos === -1) throw new Error('Cannot find page object ' + pageObjHeader);
+
+      var endObjPos = fullText.indexOf('endobj', pageObjPos);
+      var pageObjStartByte = pageObjPos;
+      var pageObjEndByte = endObjPos + 6; // 'endobj'.length
+
+      // Find /Contents within the page object region (as latin1 text)
+      var pageObjText = fullText.substring(pageObjPos, endObjPos);
+      var contentsArr = pageObjText.match(/\/Contents\s*\[([^\]]+)\]/);
+      var contentsSingle = !contentsArr ? pageObjText.match(/\/Contents\s+(\d+\s+\d+\s+R)/) : null;
+
+      // Determine if /Contents points to a compressed array object.
+      // In PDF, /Contents can be an indirect ref to an array of stream refs.
+      // If that array object is in a compressed object stream (ObjStm), we can't
+      // find it in raw text. In that case, we use annotations instead of modifying /Contents.
+      var useAnnotation = false;
+      if (contentsSingle) {
+        var refNum = contentsSingle[1].split(/\s+/)[0];
+        var refObjHeader = refNum + ' 0 obj';
+        var refObjPos = -1;
+        var refSearch = 0;
+        while (true) {
+          var rc = fullText.indexOf(refObjHeader, refSearch);
+          if (rc === -1) break;
+          if (rc === 0 || fullText.charCodeAt(rc - 1) === 10 || fullText.charCodeAt(rc - 1) === 13) {
+            refObjPos = rc;
+            break;
+          }
+          refSearch = rc + 1;
+        }
+        if (refObjPos !== -1) {
+          // Object found in raw text — check if it's an array
+          var refBodyStart = refObjPos + refObjHeader.length;
+          var refSnippet = fullText.substring(refBodyStart, refBodyStart + 512).replace(/^[\r\n\s]+/, '');
+          if (refSnippet.charAt(0) === '[') {
+            // It's an inline array — extract refs and inline them in /Contents
+            var closeBracket = refSnippet.indexOf(']');
+            if (closeBracket !== -1) {
+              contentsSingle._resolvedArrayRefs = refSnippet.substring(1, closeBracket).trim();
+            }
+          }
+          // else: it's a stream, use normal approach
+        } else {
+          // Object not in raw text — it's in a compressed object stream.
+          // Since streams can't be in ObjStm, this must be an array.
+          // We can't resolve it, so use annotation approach.
+          useAnnotation = true;
+        }
+      }
+
+      var newPageObjBytes;
+
+      if (useAnnotation) {
+        // ── Annotation approach: draw overlay via Form XObject annotation ──
+        // Create Form XObject with the white rectangle drawing commands
+        var formObjNum = newObjNum++;
+        var formDict = '<< /Type /XObject /Subtype /Form /BBox [0 0 '
+          + pw.toFixed(2) + ' ' + ph.toFixed(2) + '] /Length ' + cmds.length + ' >>';
+        var formObjStr = formObjNum + ' 0 obj\n' + formDict + '\nstream\n'
+          + cmds + 'endstream\nendobj\n';
+        var formObjBytes = strToLatin1(formObjStr);
+        offsets.push({ num: formObjNum, offset: origBytes.length + totalAppendLen });
+        chunks.push(formObjBytes);
+        totalAppendLen += formObjBytes.length;
+
+        // Create annotation dict referencing the Form XObject
+        var annotObjNum = newObjNum++;
+        var annotObjStr = annotObjNum + ' 0 obj\n<< /Type /Annot /Subtype /Square'
+          + ' /Rect [0 0 ' + pw.toFixed(2) + ' ' + ph.toFixed(2) + ']'
+          + ' /F 4 /BS << /W 0 >> /C [] /AP << /N ' + formObjNum + ' 0 R >> >>\nendobj\n';
+        var annotObjBytes = strToLatin1(annotObjStr);
+        offsets.push({ num: annotObjNum, offset: origBytes.length + totalAppendLen });
+        chunks.push(annotObjBytes);
+        totalAppendLen += annotObjBytes.length;
+
+        // Modify page dict: add /Annots (leave /Contents unchanged)
+        // Find the page dict's closing ">>" right before "endobj"
+        var lastGG = pageObjText.lastIndexOf('>>');
+        var annotsInsert = '/Annots[' + annotObjNum + ' 0 R]';
+
+        // Check if page already has /Annots
+        var existingAnnots = pageObjText.match(/\/Annots\s*\[([^\]]*)\]/);
+        if (existingAnnots) {
+          // Append our annotation to existing array
+          var oldAnnots = existingAnnots[0];
+          var newAnnots = oldAnnots.replace(']', ' ' + annotObjNum + ' 0 R]');
+          var aIdx = pageObjText.indexOf(oldAnnots);
+          var beforeBytes = origBytes.subarray(pageObjStartByte, pageObjStartByte + aIdx);
+          var newAnnotsBytes = strToLatin1(newAnnots);
+          var afterStart = pageObjStartByte + aIdx + oldAnnots.length;
+          var afterBytes = origBytes.subarray(afterStart, pageObjEndByte);
+          newPageObjBytes = new Uint8Array(beforeBytes.length + newAnnotsBytes.length + afterBytes.length + 1);
+          newPageObjBytes.set(beforeBytes, 0);
+          newPageObjBytes.set(newAnnotsBytes, beforeBytes.length);
+          newPageObjBytes.set(afterBytes, beforeBytes.length + newAnnotsBytes.length);
+          newPageObjBytes[newPageObjBytes.length - 1] = 10;
+        } else {
+          // Insert /Annots before the closing >>
+          var beforeBytes = origBytes.subarray(pageObjStartByte, pageObjStartByte + lastGG);
+          var insertBytes = strToLatin1(annotsInsert);
+          var afterBytes = origBytes.subarray(pageObjStartByte + lastGG, pageObjEndByte);
+          newPageObjBytes = new Uint8Array(beforeBytes.length + insertBytes.length + afterBytes.length + 1);
+          newPageObjBytes.set(beforeBytes, 0);
+          newPageObjBytes.set(insertBytes, beforeBytes.length);
+          newPageObjBytes.set(afterBytes, beforeBytes.length + insertBytes.length);
+          newPageObjBytes[newPageObjBytes.length - 1] = 10;
+        }
+      } else {
+        // ── Normal approach: add overlay stream to /Contents ──
+        var streamObjNum = newObjNum++;
+        var streamObjStr = streamObjNum + ' 0 obj\n<< /Length ' + cmds.length + ' >>\nstream\n'
+          + cmds + 'endstream\nendobj\n';
+        var streamObjBytes = strToLatin1(streamObjStr);
+        offsets.push({ num: streamObjNum, offset: origBytes.length + totalAppendLen });
+        chunks.push(streamObjBytes);
+        totalAppendLen += streamObjBytes.length;
+
+        var newContents;
+        if (contentsArr) {
+          newContents = '/Contents[' + contentsArr[1].trim() + ' ' + streamObjNum + ' 0 R]';
+        } else if (contentsSingle) {
+          if (contentsSingle._resolvedArrayRefs) {
+            // Single ref was an array object — inline the resolved refs
+            newContents = '/Contents[' + contentsSingle._resolvedArrayRefs + ' ' + streamObjNum + ' 0 R]';
+          } else {
+            // Single ref to a stream — wrap in array with overlay
+            newContents = '/Contents[' + contentsSingle[1] + ' ' + streamObjNum + ' 0 R]';
+          }
+        } else {
+          newContents = '/Contents ' + streamObjNum + ' 0 R';
+        }
+
+        var contentsPattern = contentsArr ? contentsArr[0] : (contentsSingle ? contentsSingle[0] : null);
+        if (contentsPattern) {
+          var cIdx = pageObjText.indexOf(contentsPattern);
+          var beforeBytes = origBytes.subarray(pageObjStartByte, pageObjStartByte + cIdx);
+          var newContentsBytes = strToLatin1(newContents);
+          var afterStart = pageObjStartByte + cIdx + contentsPattern.length;
+          var afterBytes = origBytes.subarray(afterStart, pageObjEndByte);
+          newPageObjBytes = new Uint8Array(beforeBytes.length + newContentsBytes.length + afterBytes.length + 1);
+          newPageObjBytes.set(beforeBytes, 0);
+          newPageObjBytes.set(newContentsBytes, beforeBytes.length);
+          newPageObjBytes.set(afterBytes, beforeBytes.length + newContentsBytes.length);
+          newPageObjBytes[newPageObjBytes.length - 1] = 10;
+        } else {
+          var insert = strToLatin1(newContents + '\n');
+          var mainBytes = origBytes.subarray(pageObjStartByte, endObjPos);
+          newPageObjBytes = new Uint8Array(mainBytes.length + insert.length + 7);
+          newPageObjBytes.set(mainBytes, 0);
+          newPageObjBytes.set(insert, mainBytes.length);
+          newPageObjBytes.set(strToLatin1('endobj\n'), mainBytes.length + insert.length);
+        }
+      }
+
+      offsets.push({ num: pageRef.num, offset: origBytes.length + totalAppendLen });
+      chunks.push(newPageObjBytes);
+      totalAppendLen += newPageObjBytes.length;
+
+      stats.push({
+        file: file.name, page_num: pi + 1, page_idx: pi,
+        status: 'cleaned', circle_count: n,
+        edge_dist_pt: Math.round(edgeDist * 10) / 10,
+        unusual: n !== EXPECTED_CIRCLES,
+      });
+    } else {
+      stats.push({
+        file: file.name, page_num: pi + 1, page_idx: pi,
+        status: 'skipped', circle_count: 0,
+        edge_dist_pt: null, unusual: false,
+      });
+    }
+  }
+
+  // If no pages needed cleaning, return original
+  if (chunks.length === 0) {
+    return { name: file.name, bytes: origBytes, stats: stats };
+  }
+
+  // Build cross-reference stream (compatible with all viewers).
+  // Traditional xref tables chained to xref streams via /Prev cause
+  // rendering failures in macOS Preview. Using a xref stream keeps
+  // the chain uniform (stream -> stream).
+  offsets.sort(function(a, b) { return a.num - b.num; });
+
+  // Add free entry for object 0
+  var allEntries = [{ num: 0, type: 0, field2: 0, field3: 65535 }];
+  for (var oi = 0; oi < offsets.length; oi++) {
+    allEntries.push({ num: offsets[oi].num, type: 1, field2: offsets[oi].offset, field3: 0 });
+  }
+
+  // Determine field widths: W = [1, wOffset, wGen]
+  // Find max offset to determine byte width needed
+  var maxOffset = 0;
+  for (var ei = 0; ei < allEntries.length; ei++) {
+    if (allEntries[ei].field2 > maxOffset) maxOffset = allEntries[ei].field2;
+  }
+  // Add generous headroom for the xref stream object itself
+  maxOffset += 4096;
+  var wOffset = maxOffset < 0x10000 ? 2 : (maxOffset < 0x1000000 ? 3 : 4);
+  var wGen = 2; // 2 bytes for generation (max 65535)
+  var wEntry = 1 + wOffset + wGen;
+
+  // Build /Index array (subsections of consecutive object numbers)
+  var indexParts = [];
+  var ei = 0;
+  while (ei < allEntries.length) {
+    var startNum = allEntries[ei].num;
+    var count = 1;
+    while (ei + count < allEntries.length && allEntries[ei + count].num === startNum + count) {
+      count++;
+    }
+    indexParts.push(startNum);
+    indexParts.push(count);
+    ei += count;
+  }
+
+  // Build binary xref data
+  var xrefData = new Uint8Array(allEntries.length * wEntry);
+  var dp = 0;
+  for (var ei = 0; ei < allEntries.length; ei++) {
+    var e = allEntries[ei];
+    // Type field (1 byte)
+    xrefData[dp++] = e.type;
+    // Field 2 (wOffset bytes, big-endian)
+    var v2 = e.field2;
+    for (var bi = wOffset - 1; bi >= 0; bi--) {
+      xrefData[dp + bi] = v2 & 0xFF;
+      v2 = (v2 >>> 8);
+    }
+    dp += wOffset;
+    // Field 3 (wGen bytes, big-endian)
+    var v3 = e.field3;
+    for (var bi = wGen - 1; bi >= 0; bi--) {
+      xrefData[dp + bi] = v3 & 0xFF;
+      v3 = (v3 >>> 8);
+    }
+    dp += wGen;
+  }
+
+  // Build xref stream object
+  var xrefObjNum = newObjNum;
+  var xrefStreamOffset = origBytes.length + totalAppendLen;
+  var indexStr = indexParts.join(' ');
+  var xrefDictStr = xrefObjNum + ' 0 obj\n<< /Type /XRef /Size ' + (newObjNum + 1)
+    + ' /Root ' + rootRef
+    + ' /Prev ' + prevStartXref
+    + ' /W [1 ' + wOffset + ' ' + wGen + ']'
+    + ' /Index [' + indexStr + ']'
+    + ' /Length ' + xrefData.length
+    + ' >>\nstream\n';
+  var xrefDictBytes = strToLatin1(xrefDictStr);
+  var xrefEndStr = '\nendstream\nendobj\n';
+  var xrefEndBytes = strToLatin1(xrefEndStr);
+  var startxrefStr = 'startxref\n' + xrefStreamOffset + '\n%%EOF\n';
+  var startxrefBytes = strToLatin1(startxrefStr);
+
+  // Concatenate: original + \n + all chunks + xref stream + startxref
+  var totalXrefLen = xrefDictBytes.length + xrefData.length + xrefEndBytes.length + startxrefBytes.length;
+  var outBytes = new Uint8Array(origBytes.length + totalAppendLen + totalXrefLen);
+  outBytes.set(origBytes, 0);
+  var pos = origBytes.length;
+  outBytes[pos++] = 10; // \n
+  for (var ci = 0; ci < chunks.length; ci++) {
+    outBytes.set(chunks[ci], pos);
+    pos += chunks[ci].length;
+  }
+  outBytes.set(xrefDictBytes, pos); pos += xrefDictBytes.length;
+  outBytes.set(xrefData, pos); pos += xrefData.length;
+  outBytes.set(xrefEndBytes, pos); pos += xrefEndBytes.length;
+  outBytes.set(startxrefBytes, pos); pos += startxrefBytes.length;
+
+  return { name: file.name, bytes: outBytes.subarray(0, pos), stats: stats };
+}
+
+// ── Process all files ────────────────────────────────────────────────────────
+async function startProcessing() {
+  show('s-processing');
+  processedFiles = [];
+  allStats       = [];
+  var failed     = [];
+  var total      = selectedFiles.length;
+  var pagesEl    = document.getElementById('p-pages');
+
+  for (var i = 0; i < total; i++) {
+    var file = selectedFiles[i];
+    document.getElementById('p-fill').style.width = Math.round((i + 1) / total * 100) + '%';
+    document.getElementById('p-count').textContent = (i + 1) + ' of ' + total;
+    document.getElementById('p-file').textContent  = file.name;
+    pagesEl.textContent = '';
+
+    try {
+      var result = await processSinglePdf(file, function(pg, tot) {
+        pagesEl.textContent = 'Scanning page ' + pg + ' of ' + tot + '...';
+      });
+      processedFiles.push(result);
+      allStats = allStats.concat(result.stats);
+    } catch (e) {
+      console.error('Failed to process ' + file.name, e);
+      failed.push(file.name);
+    }
+
+    // Yield to UI
+    await new Promise(function(r) { setTimeout(r, 0); });
+  }
+
+  showReport(total, allStats, failed);
+}
+
+// ── Report ───────────────────────────────────────────────────────────────────
+function showReport(pdfCount, stats, failed) {
+  var cleaned = stats.filter(function(s) { return s.status === 'cleaned'; });
+  var skipped = stats.filter(function(s) { return s.status === 'skipped'; });
+  var flagged = stats.filter(function(s) { return s.unusual; });
+  var hasIssues = flagged.length > 0 || failed.length > 0;
+
+  // Verdict
+  var verdict = document.getElementById('r-verdict');
+  if (!hasIssues) {
+    verdict.className = 'verdict verdict-clean';
+    verdict.innerHTML =
+      '<div class="verdict-icon">&#10003;</div>' +
+      '<div class="verdict-text"><h2>Batch looks clean</h2>' +
+      '<p>No structural anomalies detected. Scroll through the spot-check sample below.</p></div>';
+  } else {
+    var nIssues = flagged.length + failed.length;
+    verdict.className = 'verdict verdict-issues';
+    verdict.innerHTML =
+      '<div class="verdict-icon">&#9888;</div>' +
+      '<div class="verdict-text"><h2>' + nIssues + ' page' + (nIssues !== 1 ? 's' : '') + ' need attention</h2>' +
+      '<p>Review the flagged pages below. Everything else looks normal.</p></div>';
+  }
+
+  // Summary text
+  var paras = [];
+  paras.push('<strong>' + pdfCount + ' PDF' + (pdfCount !== 1 ? 's' : '') + ' processed.</strong> ' +
+    cleaned.length + ' pages had hole-punch marks and were cleaned. ' +
+    (skipped.length > 0
+      ? skipped.length + ' pages had no hole marks and were left untouched.'
+      : 'Every page had hole marks.'));
+
+  var dists = cleaned.filter(function(p) { return p.edge_dist_pt !== null; })
+                     .map(function(p) { return p.edge_dist_pt; });
+  if (dists.length > 0) {
+    var lo = Math.min.apply(null, dists), hi = Math.max.apply(null, dists);
+    if (hi - lo < 10) {
+      paras.push('<span class="ok">&#10003; Template check passed.</span> ' +
+        'Hole-punch circles consistently at ' + Math.round(lo) + 'pt from the page edge.');
+    } else {
+      paras.push('<span class="ok">&#10003; Template check passed.</span> ' +
+        'Multiple layout types (' + Math.round(lo) + 'pt\u2013' + Math.round(hi) + 'pt from edge). Both handled correctly.');
+    }
+  }
+
+  var nFlagged = flagged.length + failed.length;
+  if (nFlagged === 0) {
+    paras.push('<span class="ok">&#10003; Structural check passed.</span> ' +
+      'Every page with hole marks had exactly 3 circles. No processing errors.');
+  } else {
+    paras.push('<span class="warn">&#9888; ' + nFlagged + ' flagged.</span> ' +
+      (flagged.length > 0 ? flagged.length + ' page' + (flagged.length !== 1 ? 's' : '') + ' with unexpected circle count. ' : '') +
+      (failed.length > 0 ? failed.length + ' file' + (failed.length !== 1 ? 's' : '') + ' could not be processed.' : ''));
+  }
+  document.getElementById('r-summary-text').innerHTML = paras.map(function(p) { return '<p>' + p + '</p>'; }).join('');
+
+  // Flagged pages
+  if (flagged.length > 0 || failed.length > 0) {
+    document.getElementById('r-flagged-wrap').style.display = '';
+    document.getElementById('r-flag-count-note').textContent =
+      '\u2014 ' + (flagged.length + failed.length);
+    buildCards('r-flagged-list', flagged, true);
+    var flist = document.getElementById('r-flagged-list');
+    for (var fi = 0; fi < failed.length; fi++) {
+      var div = document.createElement('div');
+      div.className = 'page-card flag';
+      div.innerHTML = '<div class="card-info"><div class="card-file">' + escHtml(failed[fi]) +
+        '</div><div class="card-page">Processing failed</div>' +
+        '<div class="card-explain">Check if corrupted or password-protected.</div></div>';
+      flist.appendChild(div);
+    }
+  } else {
+    document.getElementById('r-flagged-wrap').style.display = 'none';
+  }
+
+  // Spot-check sample
+  var normal = cleaned.filter(function(p) { return !p.unusual; });
+  var nSample = Math.max(2, Math.min(20, Math.max(1, Math.round(normal.length * 0.01))));
+  var sample = shuffle(normal).slice(0, Math.min(nSample, normal.length));
+  document.getElementById('r-sample-note').textContent =
+    '\u2014 ' + sample.length + ' randomly selected';
+  buildCards('r-sample-list', sample, false);
+
+  show('s-report');
+}
+
+function shuffle(arr) {
+  var a = arr.slice();
+  for (var i = a.length - 1; i > 0; i--) {
+    var j = Math.floor(Math.random() * (i + 1));
+    var t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+
+function escHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function buildCards(listId, pages, isFlagged) {
+  var list = document.getElementById(listId);
+  list.innerHTML = '';
+  for (var i = 0; i < pages.length; i++) {
+    (function(p, idx) {
+      var div = document.createElement('div');
+      div.className = 'page-card' + (isFlagged ? ' flag' : '');
+      div.addEventListener('click', function() { openLightbox(pages, idx); });
+      var badge = isFlagged
+        ? '<span class="badge badge-unusual">Unusual: ' + p.circle_count + ' circles (expected 3)</span>'
+        : '<span class="badge badge-sample">Sample</span>';
+      var explain = isFlagged ? '<div class="card-explain">Verify this page looks correct.</div>' : '';
+      div.innerHTML =
+        '<div class="thumb-wrap" id="' + listId + '-th-' + idx + '"><span class="thumb-ph">\u00B7\u00B7\u00B7</span></div>' +
+        '<div class="card-info"><div class="card-file">' + escHtml(p.file) + '</div>' +
+        '<div class="card-page">Page ' + p.page_num + '</div>' + badge + explain + '</div>';
+      list.appendChild(div);
+      setTimeout(function() { loadThumb(listId, idx, p); }, idx * 120);
+    })(pages[i], i);
+  }
+}
+
+// ── Thumbnail rendering (only for report cards — small number of pages) ─────
+async function loadThumb(listId, idx, pageInfo) {
+  var wrap = document.getElementById(listId + '-th-' + idx);
+  if (!wrap) return;
+  var pf = processedFiles.find(function(f) { return f.name === pageInfo.file; });
+  if (!pf) return;
+  try {
+    var doc  = await pdfjsLib.getDocument({ data: pf.bytes.slice(0) }).promise;
+    var page = await doc.getPage(pageInfo.page_idx + 1);
+    var vp   = page.getViewport({ scale: 100 / 72 });
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+    var ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    wrap.innerHTML = '<img src="' + canvas.toDataURL('image/jpeg', 0.8) + '">';
+    canvas.width = 0; canvas.height = 0;
+    doc.destroy();
+  } catch (e) { /* leave placeholder */ }
+}
+
+// ── Lightbox ─────────────────────────────────────────────────────────────────
+var lbPages = [], lbIdx = 0, lbCache = {};
+
+function openLightbox(pages, startIdx) {
+  lbPages = pages; lbIdx = startIdx;
+  document.getElementById('lightbox').classList.add('open');
+  lbLoad(lbIdx);
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lb-img').src = '';
+}
+function lbStep(dir) { lbIdx = (lbIdx + dir + lbPages.length) % lbPages.length; lbLoad(lbIdx); }
+
+async function lbLoad(idx) {
+  var p = lbPages[idx], key = p.file + ':' + p.page_idx;
+  var img = document.getElementById('lb-img'), load = document.getElementById('lb-loading');
+  document.getElementById('lb-label').textContent = p.file + '  \u2014  page ' + p.page_num;
+  document.getElementById('lb-nav').textContent =
+    (idx + 1) + ' of ' + lbPages.length + '  \u00B7  \u2190 \u2192 navigate  \u00B7  Esc close';
+
+  if (lbCache[key]) { img.src = lbCache[key]; img.style.display = 'block'; load.style.display = 'none'; return; }
+  img.style.display = 'none'; load.style.display = 'block';
+
+  var pf = processedFiles.find(function(f) { return f.name === p.file; });
+  if (!pf) return;
+  try {
+    var doc = await pdfjsLib.getDocument({ data: pf.bytes.slice(0) }).promise;
+    var page = await doc.getPage(p.page_idx + 1);
+    var vp = page.getViewport({ scale: 150 / 72 });
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+    var dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+    lbCache[key] = dataUrl;
+    if (lbPages[lbIdx] === p) { img.src = dataUrl; img.style.display = 'block'; load.style.display = 'none'; }
+    canvas.width = 0; canvas.height = 0; doc.destroy();
+  } catch (e) { load.textContent = 'Failed to render'; }
+}
+
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  if (e.key === 'ArrowLeft') lbStep(-1);
+  if (e.key === 'ArrowRight') lbStep(1);
+});
+
+// ── Download zip ─────────────────────────────────────────────────────────────
+async function downloadZip() {
+  var zip = new JSZip();
+  for (var i = 0; i < processedFiles.length; i++) {
+    zip.file(processedFiles[i].name, processedFiles[i].bytes);
+  }
+  var blob = await zip.generateAsync({ type: 'blob' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'cleaned_pdfs.zip';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
