@@ -437,6 +437,279 @@ async function detectFromOps(pdfJsPage) {
   return { circles: circles, borderLines: borderLines, side: side };
 }
 
+// ── Decompression helpers (for PDFs with compressed object streams) ────────
+// Decompresses zlib/deflate bytes using browser's native DecompressionStream.
+async function inflateBytes(bytes) {
+  var ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  var reader = ds.getReader();
+  var chunks = [];
+  var total = 0;
+  while (true) {
+    var r = await reader.read();
+    if (r.done) break;
+    chunks.push(r.value);
+    total += r.value.length;
+  }
+  var out = new Uint8Array(total);
+  var offset = 0;
+  for (var i = 0; i < chunks.length; i++) { out.set(chunks[i], offset); offset += chunks[i].length; }
+  return out;
+}
+
+// PNG Up predictor (predictor 12) — the only predictor we see on PDF xref streams.
+// Each row: [tag byte][columns data bytes]. Output: columns bytes per row.
+function pngUnfilter(data, columns) {
+  var rowLen = columns + 1;
+  var nRows = Math.floor(data.length / rowLen);
+  var out = new Uint8Array(nRows * columns);
+  var prev = new Uint8Array(columns);
+  for (var r = 0; r < nRows; r++) {
+    var tag = data[r * rowLen];
+    var rs = r * rowLen + 1;
+    var os = r * columns;
+    if (tag === 2) {
+      // Up: cur + prev
+      for (var c = 0; c < columns; c++) {
+        var v = (data[rs + c] + prev[c]) & 0xFF;
+        out[os + c] = v;
+        prev[c] = v;
+      }
+    } else if (tag === 0) {
+      // None: pass through
+      for (var c = 0; c < columns; c++) {
+        out[os + c] = data[rs + c];
+        prev[c] = data[rs + c];
+      }
+    } else {
+      throw new Error('UNSUPPORTED_PREDICTOR: filter tag ' + tag + ' (only 0=None and 2=Up are implemented)');
+    }
+  }
+  return out;
+}
+
+// Find an object by number in raw text, matching at a line boundary.
+function findObjInText(fullText, objNum) {
+  var header = objNum + ' 0 obj';
+  var pos = -1;
+  var searchFrom = 0;
+  while (true) {
+    var c = fullText.indexOf(header, searchFrom);
+    if (c === -1) break;
+    if (c === 0 || fullText.charCodeAt(c - 1) === 10 || fullText.charCodeAt(c - 1) === 13) {
+      pos = c;
+      break;
+    }
+    searchFrom = c + 1;
+  }
+  return pos;
+}
+
+// Parse a stream object (dict + stream data) starting at objPos in raw text.
+// Returns { dictText, streamStart, streamEnd } with byte positions in origBytes.
+function parseStreamObj(fullText, objPos) {
+  var dictStart = fullText.indexOf('<<', objPos);
+  if (dictStart === -1) return null;
+  // Walk nested dict brackets
+  var depth = 0;
+  var p = dictStart;
+  while (p < fullText.length) {
+    if (fullText.charCodeAt(p) === 60 && fullText.charCodeAt(p + 1) === 60) {
+      depth++; p += 2;
+    } else if (fullText.charCodeAt(p) === 62 && fullText.charCodeAt(p + 1) === 62) {
+      depth--; p += 2;
+      if (depth === 0) break;
+    } else {
+      p++;
+    }
+  }
+  var dictEnd = p; // position after closing ">>"
+  var dictText = fullText.substring(dictStart, dictEnd);
+  // After dict, skip whitespace then expect "stream\n" or "stream\r\n" or "stream\r"
+  var sIdx = fullText.indexOf('stream', dictEnd);
+  if (sIdx === -1) return { dictText: dictText, streamStart: -1, streamEnd: -1 };
+  var afterStream = sIdx + 6;
+  // Skip exactly one \r\n, \n, or \r (per PDF spec)
+  if (fullText.charCodeAt(afterStream) === 13 && fullText.charCodeAt(afterStream + 1) === 10) afterStream += 2;
+  else if (fullText.charCodeAt(afterStream) === 10 || fullText.charCodeAt(afterStream) === 13) afterStream += 1;
+  // Get /Length from dict
+  var lengthM = dictText.match(/\/Length\s+(\d+)/);
+  if (!lengthM) return { dictText: dictText, streamStart: afterStream, streamEnd: -1 };
+  var length = parseInt(lengthM[1], 10);
+  return { dictText: dictText, streamStart: afterStream, streamEnd: afterStream + length };
+}
+
+// Parse a single xref stream at startPos. Returns { entries: Map, prev: number|null }.
+async function parseOneXrefStream(origBytes, fullText, startPos) {
+  var snippet = fullText.substring(startPos, startPos + 80);
+  if (!/^\d+\s+\d+\s+obj/.test(snippet)) {
+    throw new Error('Invalid xref stream header at ' + startPos);
+  }
+  var parsed = parseStreamObj(fullText, startPos);
+  if (!parsed || parsed.streamStart === -1) throw new Error('Cannot parse xref stream');
+  var dictText = parsed.dictText;
+
+  // Check filter
+  var filterM = dictText.match(/\/Filter\s*\/(\w+)/);
+  if (filterM && filterM[1] !== 'FlateDecode') {
+    throw new Error('UNSUPPORTED_FILTER: xref stream uses /' + filterM[1] + ' (only FlateDecode supported)');
+  }
+  // Check for filter chain
+  if (/\/Filter\s*\[/.test(dictText)) {
+    throw new Error('UNSUPPORTED_FILTER_CHAIN: xref stream uses multiple filters');
+  }
+
+  // Parse /W
+  var wM = dictText.match(/\/W\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s*\]/);
+  if (!wM) throw new Error('No /W in xref stream');
+  var W = [parseInt(wM[1]), parseInt(wM[2]), parseInt(wM[3])];
+  var entrySize = W[0] + W[1] + W[2];
+
+  // Parse /Index or default to [0 Size]
+  var indexPairs = [];
+  var indexM = dictText.match(/\/Index\s*\[([\s\S]*?)\]/);
+  if (indexM) {
+    var nums = indexM[1].match(/\d+/g);
+    if (nums) {
+      for (var i = 0; i + 1 < nums.length; i += 2) {
+        indexPairs.push([parseInt(nums[i]), parseInt(nums[i + 1])]);
+      }
+    }
+  } else {
+    var sizeM = dictText.match(/\/Size\s+(\d+)/);
+    if (!sizeM) throw new Error('No /Size in xref stream');
+    indexPairs.push([0, parseInt(sizeM[1])]);
+  }
+
+  // Decompress
+  var streamBytes = origBytes.subarray(parsed.streamStart, parsed.streamEnd);
+  if (filterM && filterM[1] === 'FlateDecode') {
+    streamBytes = await inflateBytes(streamBytes);
+  }
+
+  // Apply predictor if present
+  var predictorM = dictText.match(/\/Predictor\s+(\d+)/);
+  var columnsM = dictText.match(/\/Columns\s+(\d+)/);
+  var predictor = predictorM ? parseInt(predictorM[1]) : 1;
+  if (predictor >= 10) {
+    var columns = columnsM ? parseInt(columnsM[1]) : entrySize;
+    streamBytes = pngUnfilter(streamBytes, columns);
+  } else if (predictor !== 1) {
+    throw new Error('UNSUPPORTED_PREDICTOR: ' + predictor + ' (only 1=None and 10–15=PNG Up supported)');
+  }
+
+  // Parse entries
+  var entries = new Map();
+  var off = 0;
+  for (var ip = 0; ip < indexPairs.length; ip++) {
+    var startNum = indexPairs[ip][0];
+    var count = indexPairs[ip][1];
+    for (var k = 0; k < count; k++) {
+      if (off + entrySize > streamBytes.length) break;
+      var type = W[0] === 0 ? 1 : 0;
+      for (var b = 0; b < W[0]; b++) type = (type << 8) | streamBytes[off + b];
+      var f2 = 0;
+      for (var b = 0; b < W[1]; b++) f2 = (f2 * 256) + streamBytes[off + W[0] + b];
+      var f3 = 0;
+      for (var b = 0; b < W[2]; b++) f3 = (f3 * 256) + streamBytes[off + W[0] + W[1] + b];
+      entries.set(startNum + k, { type: type, field2: f2, field3: f3 });
+      off += entrySize;
+    }
+  }
+
+  // Follow /Prev chain if present — linearized PDFs often have a partial
+  // xref at the end and the main one earlier in the file.
+  var prevM = dictText.match(/\/Prev\s+(\d+)/);
+  var prev = prevM ? parseInt(prevM[1]) : null;
+  return { entries: entries, prev: prev };
+}
+
+// Follow the /Prev chain, merging entries. Later xref entries override earlier ones.
+async function parseXrefStream(origBytes, fullText, startPos) {
+  var merged = new Map();
+  var visited = new Set();
+  var pos = startPos;
+  // Walk from the newest xref backwards. Collect in reverse order so we can
+  // apply oldest-first, letting newer entries override.
+  var chain = [];
+  while (pos !== null && !visited.has(pos)) {
+    visited.add(pos);
+    chain.push(pos);
+    var one = await parseOneXrefStream(origBytes, fullText, pos);
+    pos = one.prev;
+    // Stash entries for merge phase
+    chain[chain.length - 1] = one.entries;
+  }
+  // Apply oldest -> newest so newer overrides
+  for (var i = chain.length - 1; i >= 0; i--) {
+    var e = chain[i];
+    for (var kv of e) merged.set(kv[0], kv[1]);
+  }
+  return merged;
+}
+
+// Read and decompress an ObjStm (object stream containing multiple non-stream objects).
+// Returns { First, bytes, objMap: Map<objNum, offsetWithinBytes> }
+async function readObjStm(origBytes, fullText, objStmNum, cache) {
+  if (cache.has(objStmNum)) return cache.get(objStmNum);
+  var pos = findObjInText(fullText, objStmNum);
+  if (pos === -1) throw new Error('ObjStm ' + objStmNum + ' not in raw text (nested ObjStm? unsupported)');
+  var parsed = parseStreamObj(fullText, pos);
+  if (!parsed || parsed.streamStart === -1) throw new Error('Cannot parse ObjStm ' + objStmNum);
+  var dictText = parsed.dictText;
+
+  var filterM = dictText.match(/\/Filter\s*\/(\w+)/);
+  if (filterM && filterM[1] !== 'FlateDecode') {
+    throw new Error('UNSUPPORTED_FILTER: ObjStm uses /' + filterM[1]);
+  }
+  if (/\/Filter\s*\[/.test(dictText)) {
+    throw new Error('UNSUPPORTED_FILTER_CHAIN: ObjStm uses multiple filters');
+  }
+
+  var nM = dictText.match(/\/N\s+(\d+)/);
+  var firstM = dictText.match(/\/First\s+(\d+)/);
+  if (!nM || !firstM) throw new Error('ObjStm ' + objStmNum + ' missing /N or /First');
+  var N = parseInt(nM[1]);
+  var First = parseInt(firstM[1]);
+
+  var bytes = origBytes.subarray(parsed.streamStart, parsed.streamEnd);
+  if (filterM && filterM[1] === 'FlateDecode') {
+    bytes = await inflateBytes(bytes);
+  }
+  // ObjStms with predictors are extremely rare; punt if we see one.
+  if (/\/Predictor\s+(\d+)/.test(dictText)) {
+    var pm = dictText.match(/\/Predictor\s+(\d+)/);
+    var pv = parseInt(pm[1]);
+    if (pv !== 1) throw new Error('UNSUPPORTED_PREDICTOR: ObjStm predictor ' + pv);
+  }
+
+  // Parse header: N pairs of "num offset"
+  var headerText = new TextDecoder('latin1').decode(bytes.subarray(0, First));
+  var tokens = headerText.match(/\d+/g) || [];
+  var objMap = new Map();
+  for (var i = 0; i < N; i++) {
+    objMap.set(parseInt(tokens[i * 2]), parseInt(tokens[i * 2 + 1]));
+  }
+  var result = { First: First, bytes: bytes, objMap: objMap };
+  cache.set(objStmNum, result);
+  return result;
+}
+
+// Resolve a compressed object's body bytes (no "N 0 obj" wrapper).
+async function getCompressedObjBody(origBytes, fullText, objNum, xrefEntries, objStmCache) {
+  var entry = xrefEntries.get(objNum);
+  if (!entry || entry.type !== 2) return null;
+  var objStm = await readObjStm(origBytes, fullText, entry.field2, objStmCache);
+  var offset = objStm.objMap.get(objNum);
+  if (offset === undefined) return null;
+  // Find end: next object's offset, or end of stream
+  var end = objStm.bytes.length - objStm.First;
+  var entries = Array.from(objStm.objMap.values()).sort(function(a, b) { return a - b; });
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i] > offset) { end = entries[i]; break; }
+  }
+  return objStm.bytes.subarray(objStm.First + offset, objStm.First + end);
+}
+
 // ── Process a single PDF ─────────────────────────────────────────────────────
 async function processSinglePdf(file, onPageProgress) {
   var arrayBuf = await file.arrayBuffer();
@@ -476,7 +749,10 @@ async function processSinglePdf(file, onPageProgress) {
   if (!sxMatch) throw new Error('Cannot find startxref in PDF');
   var prevStartXref = parseInt(sxMatch[1], 10);
 
-  // Find /Root and /Size from trailer dict or xref stream object
+  // Find /Root and /Size from trailer dict or xref stream object.
+  // Xref stream dicts can be very large (long /Index arrays for PDFs with
+  // thousands of compressed objects), so we read up to the dict's end marker
+  // ">>\nstream" or ">>\rstream" rather than a fixed window.
   var rootRef = null, prevSize = 0;
   var trailerMatch = tailText.match(/trailer\s*<<([\s\S]*?)>>/);
   if (trailerMatch) {
@@ -486,9 +762,19 @@ async function processSinglePdf(file, onPageProgress) {
     if (rootM) rootRef = rootM[1] + ' ' + rootM[2] + ' R';
     if (sizeM) prevSize = parseInt(sizeM[1], 10);
   } else {
-    var xsChunk = new TextDecoder('latin1').decode(
-      origBytes.subarray(prevStartXref, Math.min(prevStartXref + 2048, origBytes.length))
-    );
+    // Read progressively larger windows until we find the dict's end marker
+    var xsChunk = '';
+    var chunkSize = 8192;
+    var maxRead = Math.min(2 * 1024 * 1024, origBytes.length - prevStartXref); // cap at 2MB
+    while (chunkSize <= maxRead) {
+      xsChunk = new TextDecoder('latin1').decode(
+        origBytes.subarray(prevStartXref, prevStartXref + chunkSize)
+      );
+      // Look for end of dict: ">>" followed by whitespace and "stream"
+      if (/>>\s*stream/.test(xsChunk)) break;
+      if (chunkSize >= maxRead) break;
+      chunkSize = Math.min(chunkSize * 2, maxRead);
+    }
     var rootM = xsChunk.match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
     var sizeM = xsChunk.match(/\/Size\s+(\d+)/);
     if (rootM) rootRef = rootM[1] + ' ' + rootM[2] + ' R';
@@ -505,6 +791,11 @@ async function processSinglePdf(file, onPageProgress) {
 
   // Decode full PDF as latin1 for page object lookups
   var fullText = new TextDecoder('latin1').decode(origBytes);
+
+  // Lazy-parsed xref stream entries + ObjStm cache, for PDFs that store page
+  // objects inside compressed object streams.
+  var xrefEntries = null;
+  var objStmCache = new Map();
 
   for (var pi = 0; pi < numPages; pi++) {
     var det = pageDetections[pi];
@@ -539,29 +830,55 @@ async function processSinglePdf(file, onPageProgress) {
       }
       cmds += 'Q\n';
 
-      // Find original page object in raw bytes
-      // Must match at a line boundary to avoid false matches (e.g. "1 0 obj" inside "18201 0 obj")
+      // Find original page object. Most PDFs have it directly in raw text.
+      // Some PDFs (e.g. Adobe InDesign output with aggressive compression) put
+      // page objects inside compressed object streams — in that case we parse
+      // the xref stream and decompress the ObjStm to get the dict body.
       var pageRef = info.ref;
       var pageObjHeader = pageRef.num + ' ' + pageRef.gen + ' obj';
-      var pageObjPos = -1;
-      var searchFrom = 0;
-      while (true) {
-        var candidate = fullText.indexOf(pageObjHeader, searchFrom);
-        if (candidate === -1) break;
-        if (candidate === 0 || fullText.charCodeAt(candidate - 1) === 10 || fullText.charCodeAt(candidate - 1) === 13) {
-          pageObjPos = candidate;
-          break;
+      var pageObjPos = findObjInText(fullText, pageRef.num);
+
+      // src/pageObjStartByte/pageObjEndByte/pageObjText unify the two code paths:
+      // - raw-text page: src=origBytes, positions are absolute in origBytes
+      // - compressed page: src=synthesized "N 0 obj\n<dict>\nendobj" buffer, positions 0..src.length
+      var src, pageObjStartByte, pageObjEndByte, pageObjText;
+
+      if (pageObjPos !== -1) {
+        var endObjPos = fullText.indexOf('endobj', pageObjPos);
+        src = origBytes;
+        pageObjStartByte = pageObjPos;
+        pageObjEndByte = endObjPos + 6; // 'endobj'.length
+        pageObjText = fullText.substring(pageObjPos, endObjPos);
+      } else {
+        // Page object is compressed — lazily parse xref stream, then fetch dict body.
+        if (!xrefEntries) {
+          try {
+            xrefEntries = await parseXrefStream(origBytes, fullText, prevStartXref);
+          } catch (e) {
+            throw new Error('COMPRESSED_XREF_PARSE_FAILED: ' + e.message);
+          }
         }
-        searchFrom = candidate + 1;
+        var dictBody;
+        try {
+          dictBody = await getCompressedObjBody(origBytes, fullText, pageRef.num, xrefEntries, objStmCache);
+        } catch (e) {
+          throw new Error('COMPRESSED_OBJSTM_FAILED: ' + e.message);
+        }
+        if (!dictBody) {
+          throw new Error('Cannot locate page object ' + pageRef.num + ' (not in raw text or any ObjStm)');
+        }
+        // Wrap dict body with "NUM GEN obj\n<dict>\nendobj" so the rest of the
+        // code can work uniformly with byte-level splicing.
+        var wrapperBytes = strToLatin1(pageRef.num + ' ' + pageRef.gen + ' obj\n');
+        var footerBytes = strToLatin1('\nendobj');
+        src = new Uint8Array(wrapperBytes.length + dictBody.length + footerBytes.length);
+        src.set(wrapperBytes, 0);
+        src.set(dictBody, wrapperBytes.length);
+        src.set(footerBytes, wrapperBytes.length + dictBody.length);
+        pageObjStartByte = 0;
+        pageObjEndByte = src.length;
+        pageObjText = new TextDecoder('latin1').decode(src.subarray(0, src.length - 6)); // exclude 'endobj'
       }
-      if (pageObjPos === -1) throw new Error('Cannot find page object ' + pageObjHeader);
-
-      var endObjPos = fullText.indexOf('endobj', pageObjPos);
-      var pageObjStartByte = pageObjPos;
-      var pageObjEndByte = endObjPos + 6; // 'endobj'.length
-
-      // Find /Contents within the page object region (as latin1 text)
-      var pageObjText = fullText.substring(pageObjPos, endObjPos);
       var contentsArr = pageObjText.match(/\/Contents\s*\[([^\]]+)\]/);
       var contentsSingle = !contentsArr ? pageObjText.match(/\/Contents\s+(\d+\s+\d+\s+R)/) : null;
 
@@ -641,10 +958,10 @@ async function processSinglePdf(file, onPageProgress) {
           var oldAnnots = existingAnnots[0];
           var newAnnots = oldAnnots.replace(']', ' ' + annotObjNum + ' 0 R]');
           var aIdx = pageObjText.indexOf(oldAnnots);
-          var beforeBytes = origBytes.subarray(pageObjStartByte, pageObjStartByte + aIdx);
+          var beforeBytes = src.subarray(pageObjStartByte, pageObjStartByte + aIdx);
           var newAnnotsBytes = strToLatin1(newAnnots);
           var afterStart = pageObjStartByte + aIdx + oldAnnots.length;
-          var afterBytes = origBytes.subarray(afterStart, pageObjEndByte);
+          var afterBytes = src.subarray(afterStart, pageObjEndByte);
           newPageObjBytes = new Uint8Array(beforeBytes.length + newAnnotsBytes.length + afterBytes.length + 1);
           newPageObjBytes.set(beforeBytes, 0);
           newPageObjBytes.set(newAnnotsBytes, beforeBytes.length);
@@ -652,9 +969,9 @@ async function processSinglePdf(file, onPageProgress) {
           newPageObjBytes[newPageObjBytes.length - 1] = 10;
         } else {
           // Insert /Annots before the closing >>
-          var beforeBytes = origBytes.subarray(pageObjStartByte, pageObjStartByte + lastGG);
+          var beforeBytes = src.subarray(pageObjStartByte, pageObjStartByte + lastGG);
           var insertBytes = strToLatin1(annotsInsert);
-          var afterBytes = origBytes.subarray(pageObjStartByte + lastGG, pageObjEndByte);
+          var afterBytes = src.subarray(pageObjStartByte + lastGG, pageObjEndByte);
           newPageObjBytes = new Uint8Array(beforeBytes.length + insertBytes.length + afterBytes.length + 1);
           newPageObjBytes.set(beforeBytes, 0);
           newPageObjBytes.set(insertBytes, beforeBytes.length);
@@ -689,10 +1006,10 @@ async function processSinglePdf(file, onPageProgress) {
         var contentsPattern = contentsArr ? contentsArr[0] : (contentsSingle ? contentsSingle[0] : null);
         if (contentsPattern) {
           var cIdx = pageObjText.indexOf(contentsPattern);
-          var beforeBytes = origBytes.subarray(pageObjStartByte, pageObjStartByte + cIdx);
+          var beforeBytes = src.subarray(pageObjStartByte, pageObjStartByte + cIdx);
           var newContentsBytes = strToLatin1(newContents);
           var afterStart = pageObjStartByte + cIdx + contentsPattern.length;
-          var afterBytes = origBytes.subarray(afterStart, pageObjEndByte);
+          var afterBytes = src.subarray(afterStart, pageObjEndByte);
           newPageObjBytes = new Uint8Array(beforeBytes.length + newContentsBytes.length + afterBytes.length + 1);
           newPageObjBytes.set(beforeBytes, 0);
           newPageObjBytes.set(newContentsBytes, beforeBytes.length);
@@ -700,7 +1017,8 @@ async function processSinglePdf(file, onPageProgress) {
           newPageObjBytes[newPageObjBytes.length - 1] = 10;
         } else {
           var insert = strToLatin1(newContents + '\n');
-          var mainBytes = origBytes.subarray(pageObjStartByte, endObjPos);
+          // pageObjEndByte points past "endobj"; we want to end right before it.
+          var mainBytes = src.subarray(pageObjStartByte, pageObjEndByte - 6);
           newPageObjBytes = new Uint8Array(mainBytes.length + insert.length + 7);
           newPageObjBytes.set(mainBytes, 0);
           newPageObjBytes.set(insert, mainBytes.length);
@@ -852,7 +1170,7 @@ async function startProcessing() {
       allStats = allStats.concat(result.stats);
     } catch (e) {
       console.error('Failed to process ' + file.name, e);
-      failed.push(file.name);
+      failed.push({ name: file.name, error: e && e.message ? e.message : String(e) });
     }
 
     // Yield to UI
@@ -926,11 +1244,24 @@ function showReport(pdfCount, stats, failed) {
     buildCards('r-flagged-list', flagged, true);
     var flist = document.getElementById('r-flagged-list');
     for (var fi = 0; fi < failed.length; fi++) {
+      var f = failed[fi];
+      var name = f.name || f; // backward-compat if a string sneaks through
+      var msg = f.error || '';
+      var explain;
+      if (/^COMPRESSED_OBJECTS:/.test(msg)) {
+        explain = 'PDF uses compressed object streams. Re-save in Adobe Acrobat (Save As, uncheck &ldquo;Object compression&rdquo;) or print-to-PDF, then re-run.';
+      } else if (/Cannot find (startxref|\/Root|\/Size)/.test(msg)) {
+        explain = 'PDF trailer could not be parsed &mdash; the file may be truncated or malformed.';
+      } else if (msg) {
+        explain = 'Error: ' + escHtml(msg.slice(0, 200));
+      } else {
+        explain = 'Check if corrupted or password-protected.';
+      }
       var div = document.createElement('div');
       div.className = 'page-card flag';
-      div.innerHTML = '<div class="card-info"><div class="card-file">' + escHtml(failed[fi]) +
+      div.innerHTML = '<div class="card-info"><div class="card-file">' + escHtml(name) +
         '</div><div class="card-page">Processing failed</div>' +
-        '<div class="card-explain">Check if corrupted or password-protected.</div></div>';
+        '<div class="card-explain">' + explain + '</div></div>';
       flist.appendChild(div);
     }
   } else {
