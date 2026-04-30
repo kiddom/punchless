@@ -250,6 +250,10 @@ var HOLE_SIZE_TOL     = 5;
 var CIRCLE_BUFFER     = 5;
 var EXPECTED_CIRCLES  = 3;
 
+// Mutable per-run color, defaults to HOLE_COLOR_PDFJS but may be overridden
+// by autoDetectHoleColor() if the PDF uses a different gray.
+var currentHoleColor  = HOLE_COLOR_PDFJS;
+
 // pdf.js OPS constants
 var OPS = pdfjsLib.OPS;
 
@@ -313,10 +317,11 @@ function transformPt(ctm, x, y) {
 }
 
 // ── Color matching ───────────────────────────────────────────────────────────
+// Reads currentHoleColor (mutable) so per-run auto-detection can override.
 function isHolePunchColor(r, g, b) {
-  return Math.abs(r - HOLE_COLOR_PDFJS[0]) < COLOR_TOLERANCE &&
-         Math.abs(g - HOLE_COLOR_PDFJS[1]) < COLOR_TOLERANCE &&
-         Math.abs(b - HOLE_COLOR_PDFJS[2]) < COLOR_TOLERANCE;
+  return Math.abs(r - currentHoleColor[0]) < COLOR_TOLERANCE &&
+         Math.abs(g - currentHoleColor[1]) < COLOR_TOLERANCE &&
+         Math.abs(b - currentHoleColor[2]) < COLOR_TOLERANCE;
 }
 
 // ── Bounding box from path sub-ops + coords, transformed by CTM ─────────────
@@ -386,7 +391,20 @@ async function detectFromOps(pdfJsPage) {
         break;
       case 74: // paintFormXObjectBegin — apply form matrix
         ctmStack.push(ctm.slice());
-        if (args[i] && args[i][0]) ctm = matMul(ctm, args[i][0]);
+        // Scan args for a 6-element numeric array (the transform matrix).
+        // pdf.js arg layout for this op has varied across versions; the
+        // matrix may be at args[i][0] or later. Identifying by shape is
+        // robust to layout changes.
+        if (args[i]) {
+          for (var ai = 0; ai < args[i].length; ai++) {
+            var arg = args[i][ai];
+            if (Array.isArray(arg) && arg.length === 6 &&
+                typeof arg[0] === 'number') {
+              ctm = matMul(ctm, arg);
+              break;
+            }
+          }
+        }
         break;
       case 75: // paintFormXObjectEnd
         if (ctmStack.length) ctm = ctmStack.pop();
@@ -531,10 +549,23 @@ function parseStreamObj(fullText, objPos) {
   // Skip exactly one \r\n, \n, or \r (per PDF spec)
   if (fullText.charCodeAt(afterStream) === 13 && fullText.charCodeAt(afterStream + 1) === 10) afterStream += 2;
   else if (fullText.charCodeAt(afterStream) === 10 || fullText.charCodeAt(afterStream) === 13) afterStream += 1;
-  // Get /Length from dict
-  var lengthM = dictText.match(/\/Length\s+(\d+)/);
-  if (!lengthM) return { dictText: dictText, streamStart: afterStream, streamEnd: -1 };
-  var length = parseInt(lengthM[1], 10);
+  // Get /Length from dict. Per PDF spec /Length may be an indirect reference,
+  // e.g. "/Length 999 0 R" — in that case we look up the referenced object
+  // and parse its body as a number.
+  var indirectM = dictText.match(/\/Length\s+(\d+)\s+(\d+)\s+R/);
+  var length = null;
+  if (indirectM) {
+    var refPos = findObjInText(fullText, parseInt(indirectM[1], 10));
+    if (refPos !== -1) {
+      var bodyStart = refPos + (indirectM[1] + ' 0 obj').length;
+      var bodyM = fullText.substring(bodyStart, bodyStart + 64).match(/\s*(\d+)/);
+      if (bodyM) length = parseInt(bodyM[1], 10);
+    }
+  } else {
+    var lengthM = dictText.match(/\/Length\s+(\d+)/);
+    if (lengthM) length = parseInt(lengthM[1], 10);
+  }
+  if (length === null) return { dictText: dictText, streamStart: afterStream, streamEnd: -1 };
   return { dictText: dictText, streamStart: afterStream, streamEnd: afterStream + length };
 }
 
@@ -710,25 +741,134 @@ async function getCompressedObjBody(origBytes, fullText, objNum, xrefEntries, ob
   return objStm.bytes.subarray(objStm.First + offset, objStm.First + end);
 }
 
+// ── Auto-detect hole-punch color ─────────────────────────────────────────────
+// Different prepress workflows use slightly different grays. The default
+// HOLE_COLOR_PDFJS = (196,197,199) ± 10 misses files that use, say,
+// (180,180,180) or (210,212,213). This function scans the first few pages
+// for stroked ~22.5pt-square paths in any gray-ish color, picks the most
+// common one (provided it appears at least 3 times — the typical 3-hole
+// pattern), and returns it for use as the per-run color. Returns null if
+// no plausible hole-punch color is found, in which case we fall back to
+// HOLE_COLOR_PDFJS.
+async function autoDetectHoleColor(pdfDoc) {
+  var pagesToScan = Math.min(5, pdfDoc.numPages);
+  var candidates = new Map(); // "r,g,b" -> { color: [r,g,b], count: N }
+
+  for (var p = 1; p <= pagesToScan; p++) {
+    var page = await pdfDoc.getPage(p);
+    var opList = await page.getOperatorList();
+    var fn = opList.fnArray;
+    var args = opList.argsArray;
+
+    var ctm = [1, 0, 0, 1, 0, 0];
+    var ctmStack = [];
+    var strokeColor = null;
+    var paths = [];
+
+    for (var i = 0; i < fn.length; i++) {
+      switch (fn[i]) {
+        case OPS.save: ctmStack.push(ctm.slice()); break;
+        case OPS.restore: if (ctmStack.length) ctm = ctmStack.pop(); break;
+        case OPS.transform: ctm = matMul(ctm, args[i]); break;
+        case 74:
+          ctmStack.push(ctm.slice());
+          if (args[i]) {
+            for (var ai = 0; ai < args[i].length; ai++) {
+              var arg = args[i][ai];
+              if (Array.isArray(arg) && arg.length === 6 && typeof arg[0] === 'number') {
+                ctm = matMul(ctm, arg); break;
+              }
+            }
+          }
+          break;
+        case 75: if (ctmStack.length) ctm = ctmStack.pop(); break;
+        case OPS.setStrokeRGBColor:
+          var c = args[i];
+          // Only consider gray-ish colors (R≈G≈B) in the mid range
+          if (Math.abs(c[0] - c[1]) < 8 && Math.abs(c[1] - c[2]) < 8 &&
+              c[0] >= 80 && c[0] <= 230) {
+            strokeColor = [c[0], c[1], c[2]];
+          } else {
+            strokeColor = null;
+          }
+          break;
+        case OPS.constructPath:
+          if (strokeColor) paths.push({ subOps: args[i][0], coords: args[i][1] });
+          break;
+        case OPS.stroke:
+          if (strokeColor) {
+            for (var pi = 0; pi < paths.length; pi++) {
+              var bbox = computePathBBox(paths[pi].subOps, paths[pi].coords, ctm);
+              if (bbox &&
+                  Math.abs(bbox.width - HOLE_SIZE_PT) < HOLE_SIZE_TOL &&
+                  Math.abs(bbox.height - HOLE_SIZE_PT) < HOLE_SIZE_TOL) {
+                var key = strokeColor[0] + ',' + strokeColor[1] + ',' + strokeColor[2];
+                if (!candidates.has(key)) candidates.set(key, { color: strokeColor, count: 0 });
+                candidates.get(key).count++;
+              }
+            }
+          }
+          paths = [];
+          break;
+        case OPS.fill: case OPS.eoFill: case OPS.fillStroke:
+        case OPS.eoFillStroke: case OPS.endPath:
+          paths = [];
+          break;
+      }
+    }
+  }
+
+  // Pick the color with the most matches, requiring at least 3 (one set of holes)
+  var best = null;
+  for (var entry of candidates.values()) {
+    if (entry.count >= 3 && (!best || entry.count > best.count)) best = entry;
+  }
+  return best ? best.color : null;
+}
+
 // ── Process a single PDF ─────────────────────────────────────────────────────
 async function processSinglePdf(file, onPageProgress) {
   var arrayBuf = await file.arrayBuffer();
 
+  // Reject encrypted PDFs upfront: our raw-byte modification can't operate
+  // on encrypted page object bytes, and pdf.js detection would also be
+  // meaningless without the password. Faster + clearer than failing later.
+  // Check the last 16KB for /Encrypt — the trailer always lives there.
+  var earlyTailSize = Math.min(arrayBuf.byteLength, 16384);
+  var earlyTail = new TextDecoder('latin1').decode(
+    new Uint8Array(arrayBuf, arrayBuf.byteLength - earlyTailSize)
+  );
+  if (/\/Encrypt\s/.test(earlyTail)) {
+    throw new Error('ENCRYPTED_PDF: Encrypted PDFs are not supported. Decrypt with Adobe Acrobat (File → Properties → Security → Set Security Method: No Security) or `qpdf --decrypt input.pdf output.pdf` first.');
+  }
+
   // ── Detection pass: pdf.js operator list (fast, no canvas rendering) ──
   var pdfDoc = await pdfjsLib.getDocument({ data: arrayBuf.slice(0) }).promise;
   var numPages = pdfDoc.numPages;
+
+  // Auto-detect the hole-punch color for this PDF. Most files use the
+  // standard (196,197,199), but some prepress workflows produce slightly
+  // different grays. Falls back to the default if no plausible color found.
+  var detectedColor = await autoDetectHoleColor(pdfDoc);
+  currentHoleColor = detectedColor || HOLE_COLOR_PDFJS;
+
   var pageDetections = [];
   var pageInfos = [];
 
-  for (var p = 1; p <= numPages; p++) {
-    if (onPageProgress && p % 20 === 0) onPageProgress(p, numPages);
-    var page = await pdfDoc.getPage(p);
-    var det = await detectFromOps(page);
-    var vp = page.getViewport({ scale: 1 });
-    pageDetections.push(det);
-    pageInfos.push({ ref: page.ref, width: vp.width, height: vp.height });
+  try {
+    for (var p = 1; p <= numPages; p++) {
+      if (onPageProgress && p % 20 === 0) onPageProgress(p, numPages);
+      var page = await pdfDoc.getPage(p);
+      var det = await detectFromOps(page);
+      var vp = page.getViewport({ scale: 1 });
+      pageDetections.push(det);
+      pageInfos.push({ ref: page.ref, width: vp.width, height: vp.height });
+    }
+  } finally {
+    // Always restore the default color, even if detection throws.
+    currentHoleColor = HOLE_COLOR_PDFJS;
+    pdfDoc.destroy();
   }
-  pdfDoc.destroy();
 
   // ── Modification pass: raw PDF incremental save ──
   var stats = [];
@@ -1251,8 +1391,12 @@ function showReport(pdfCount, stats, failed) {
       var name = f.name || f; // backward-compat if a string sneaks through
       var msg = f.error || '';
       var explain;
-      if (/^COMPRESSED_OBJECTS:/.test(msg)) {
+      if (/^ENCRYPTED_PDF:/.test(msg)) {
+        explain = 'PDF is encrypted. Decrypt in Adobe Acrobat (Properties &rarr; Security &rarr; No Security) or run <code>qpdf --decrypt</code>, then re-run.';
+      } else if (/^COMPRESSED_OBJECTS:/.test(msg)) {
         explain = 'PDF uses compressed object streams. Re-save in Adobe Acrobat (Save As, uncheck &ldquo;Object compression&rdquo;) or print-to-PDF, then re-run.';
+      } else if (/^UNSUPPORTED_(FILTER|PREDICTOR|FILTER_CHAIN)/.test(msg)) {
+        explain = 'PDF uses an unsupported compression scheme. Re-save in Adobe Acrobat to normalize it, then re-run. (' + escHtml(msg.split(':')[0]) + ')';
       } else if (/Cannot find (startxref|\/Root|\/Size)/.test(msg)) {
         explain = 'PDF trailer could not be parsed &mdash; the file may be truncated or malformed.';
       } else if (msg) {
