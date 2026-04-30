@@ -762,11 +762,13 @@ async function processSinglePdf(file, onPageProgress) {
     if (rootM) rootRef = rootM[1] + ' ' + rootM[2] + ' R';
     if (sizeM) prevSize = parseInt(sizeM[1], 10);
   } else {
-    // Read progressively larger windows until we find the dict's end marker
+    // Read progressively larger windows until we find the dict's end marker.
+    // Always read at least once, even if the available bytes are smaller than
+    // the initial chunk size (xref streams near EOF can be < 8KB).
     var xsChunk = '';
-    var chunkSize = 8192;
     var maxRead = Math.min(2 * 1024 * 1024, origBytes.length - prevStartXref); // cap at 2MB
-    while (chunkSize <= maxRead) {
+    var chunkSize = Math.min(8192, maxRead);
+    while (true) {
       xsChunk = new TextDecoder('latin1').decode(
         origBytes.subarray(prevStartXref, prevStartXref + chunkSize)
       );
