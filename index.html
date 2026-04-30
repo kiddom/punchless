@@ -811,9 +811,13 @@ async function processSinglePdf(file, onPageProgress) {
       var onLeft = det.side === 'left';
       var edgeDist = onLeft ? avgX : (pw - avgX);
 
-      // Build white rectangle drawing commands (pure ASCII)
-      // Draw tight bounding rects around each circle + buffer.
-      // If circles are near the page edge, extend to the edge.
+      // Build white rectangle drawing commands (pure ASCII).
+      // Draw a tight bounding rect around each circle + buffer. Do NOT extend
+      // to the page edge: on layouts where punches sit ~95pt from the edge
+      // (rather than at the very margin), the ISBN/colophon text often
+      // starts around x=99 and an edge-extending rect was clipping it.
+      // The tight 32.5pt box reliably covers the punch ink without reaching
+      // any text column.
       var cmds = 'q\n1 1 1 rg\n';
       for (var ci = 0; ci < det.circles.length; ci++) {
         var c = det.circles[ci];
@@ -821,9 +825,6 @@ async function processSinglePdf(file, onPageProgress) {
         var ry = c.y0 - CIRCLE_BUFFER;
         var rw = c.width + 2 * CIRCLE_BUFFER;
         var rh = c.height + 2 * CIRCLE_BUFFER;
-        // If close to page edge, extend rect to the edge
-        if (onLeft && rx < 50) { rw += rx; rx = 0; }
-        if (!onLeft && (rx + rw) > (pw - 50)) { rw = pw - rx; }
         cmds += rx.toFixed(2) + ' ' + ry.toFixed(2) + ' ' + rw.toFixed(2) + ' ' + rh.toFixed(2) + ' re f\n';
       }
       for (var li = 0; li < det.borderLines.length; li++) {
